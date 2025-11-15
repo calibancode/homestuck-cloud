@@ -60,7 +60,7 @@
     );
 
     // load vector data
-    const data = await fetch("output.json").then(res => res.json());
+    const data = await fetch("vectors.json").then(res => res.json());
     loading.remove();
 
     const group = new THREE.Group();

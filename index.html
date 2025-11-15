@@ -1,330 +1,164 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
 <meta charset="UTF-8">
-<title>semantic cloud viewer</title>
+<title>2D Semantic Explorer</title>
 <style>
-    :root {
-        color-scheme: dark;
-    }
-
     body {
         margin: 0;
         overflow: hidden;
-        background: radial-gradient(circle at top, #141420 0, #050509 55%, #000 100%);
-        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-            sans-serif;
-        color: #eee;
+        background: #0a0a0f;
+        font-family: sans-serif;
+        color: white;
     }
-
-    #loading {
+    #info {
         position: fixed;
-        top: 50%;
-        left: 50%;
-        transform: translate(-50%, -50%);
-        color: #aaa;
-        font-size: 13px;
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-        text-align: center;
-        padding: 10px 18px;
-        background: rgba(5, 5, 12, 0.92);
-        border-radius: 999px;
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        backdrop-filter: blur(12px);
+        top: 10px;
+        left: 10px;
+        background: rgba(0,0,0,0.5);
+        padding: 6px 10px;
+        border-radius: 6px;
+        font-size: 14px;
         pointer-events: none;
-        z-index: 10;
-    }
-
-    #scene {
-        width: 100%;
-        height: 100%;
-        display: block;
-        opacity: 0;
-        transition: opacity 0.4s ease-out;
-    }
-
-    #scene.ready {
-        opacity: 1;
+        max-width: 380px;
+        white-space: pre-wrap;
     }
 </style>
 </head>
-
 <body>
-<div id="loading">loading…</div>
 
-<script type="module">
-    import * as THREE from "https://esm.sh/three@0.161.0";
-    import { OrbitControls } from "https://esm.sh/three@0.161.0/examples/jsm/controls/OrbitControls.js";
-    import { FontLoader } from "https://esm.sh/three@0.161.0/examples/jsm/loaders/FontLoader.js";
-    import { TextGeometry } from "https://esm.sh/three@0.161.0/examples/jsm/geometries/TextGeometry.js";
+<canvas id="c"></canvas>
+<div id="info">loading…</div>
 
-    const loading = document.getElementById("loading");
+<script src="https://cdn.jsdelivr.net/npm/regl/dist/regl.min.js"></script>
 
-    // ------------------------------------------------------------
-    // scene + renderer
-    // ------------------------------------------------------------
-    const scene = new THREE.Scene();
+<script>
+const canvas = document.getElementById("c");
+const info = document.getElementById("info");
 
-    const camera = new THREE.PerspectiveCamera(
-        60,
-        window.innerWidth / window.innerHeight,
-        0.1,
-        5000
-    );
-    camera.position.set(0, 0, 8);
+function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
 
-    const renderer = new THREE.WebGLRenderer({
-        antialias: true,
-        alpha: false
-    });
-    renderer.setPixelRatio(window.devicePixelRatio || 1);
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setClearColor(0x050509, 1);
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.1;
+// --------------------------------------
+// load vectors.json
+// --------------------------------------
+fetch("vectors.json")
+    .then(r => r.json())
+    .then(run);
 
-    const canvas = renderer.domElement;
-    canvas.id = "scene";
-    document.body.appendChild(canvas);
+function run(data) {
+    info.textContent = "loaded " + data.points.length + " points";
 
-    // ------------------------------------------------------------
-    // controls
-    // ------------------------------------------------------------
-    const controls = new OrbitControls(camera, canvas);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.06;
-    controls.rotateSpeed = 0.7;
-    controls.zoomSpeed = 0.8;
-    controls.enablePan = true;
+    const pts = data.points;
 
-    // ------------------------------------------------------------
-    // lights (for labels)
-    // ------------------------------------------------------------
-    scene.add(new THREE.AmbientLight(0xffffff, 0.5));
-    const keyLight = new THREE.PointLight(0xffffff, 1.4, 0, 2);
-    keyLight.position.set(8, 10, 12);
-    scene.add(keyLight);
+    const positions = pts.map(p => [p.x, p.y]);
+    const colors = pts.map(p => [p.r, p.g, p.b]);
+    const labels = pts.map(p => p.label);
 
-    // ------------------------------------------------------------
-    // root group
-    // ------------------------------------------------------------
-    const group = new THREE.Group();
-    scene.add(group);
+    // pan & zoom
+    let zoom = 1.0;
+    let offset = [0, 0];
 
-    let pointsMesh = null;
+    canvas.onwheel = e => {
+        const z = Math.exp(-e.deltaY * 0.001);
+        zoom *= z;
+    };
 
-    // ------------------------------------------------------------
-    // resize
-    // ------------------------------------------------------------
-    window.addEventListener("resize", () => {
-        camera.aspect = window.innerWidth / window.innerHeight;
-        camera.updateProjectionMatrix();
-        renderer.setSize(window.innerWidth, window.innerHeight);
-    });
+    let dragging = false;
+    let lx = 0, ly = 0;
 
-    // ------------------------------------------------------------
-    // small circular sprite texture for points
-    // ------------------------------------------------------------
-    function makeCircleTexture() {
-        const size = 64;
-        const cvs = document.createElement("canvas");
-        cvs.width = cvs.height = size;
-        const ctx = cvs.getContext("2d");
-
-        ctx.clearRect(0, 0, size, size);
-        const r = size / 2 - 1;
-
-        const grad = ctx.createRadialGradient(
-            size / 2,
-            size / 2,
-            r * 0.1,
-            size / 2,
-            size / 2,
-            r
-        );
-        grad.addColorStop(0, "rgba(255,255,255,1)");
-        grad.addColorStop(1, "rgba(255,255,255,0)");
-
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(size / 2, size / 2, r, 0, Math.PI * 2);
-        ctx.fill();
-
-        const tex = new THREE.CanvasTexture(cvs);
-        tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
-        tex.needsUpdate = true;
-        return tex;
-    }
-
-    const circleTexture = makeCircleTexture();
-
-    // ------------------------------------------------------------
-    // camera framing (no normalization, just view-fitting)
-    // ------------------------------------------------------------
-    function frameCameraToBounds(center, radius) {
-        if (!isFinite(radius) || radius <= 0) {
-            camera.position.set(center.x, center.y, center.z + 5);
-            camera.near = 0.1;
-            camera.far = 1000;
-            camera.updateProjectionMatrix();
-            controls.target.copy(center);
-            controls.update();
-            return;
+    canvas.onmousedown = e => {
+        dragging = true;
+        lx = e.clientX;
+        ly = e.clientY;
+    };
+    canvas.onmouseup = () => dragging = false;
+    canvas.onmouseleave = () => dragging = false;
+    canvas.onmousemove = e => {
+        if (dragging) {
+            offset[0] += (e.clientX - lx) / zoom;
+            offset[1] -= (e.clientY - ly) / zoom;
+            lx = e.clientX;
+            ly = e.clientY;
         }
+    };
 
-        const fov = THREE.MathUtils.degToRad(camera.fov);
-        const dist = radius / Math.sin(fov / 2) * 1.2;
+    // nearest-point hover
+    canvas.addEventListener("mousemove", e => {
+        const rect = canvas.getBoundingClientRect();
+        const x = (e.clientX - rect.left - canvas.width/2) / zoom - offset[0];
+        const y = -(e.clientY - rect.top - canvas.height/2) / zoom - offset[1];
 
-        camera.position.set(center.x, center.y, center.z + dist);
-        camera.near = Math.max(radius / 100, 0.01);
-        camera.far = radius * 10;
-        camera.updateProjectionMatrix();
+        let best = -1;
+        let bd = 0.03;
 
-        controls.target.copy(center);
-        controls.update();
-    }
-
-    // ------------------------------------------------------------
-    // build cloud (raw coordinates, all labels visible)
-    // ------------------------------------------------------------
-    function initCloud(font, data) {
-        const list = Array.isArray(data.points) ? data.points : [];
-        if (!list.length) {
-            loading.textContent = "vectors.json has no points";
-            return;
-        }
-
-        const numPoints = list.length;
-
-        // bounds (for camera only, data stays raw)
-        let minX = Infinity, minY = Infinity, minZ = Infinity;
-        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-
-        for (const p of list) {
-            if (p.x < minX) minX = p.x;
-            if (p.y < minY) minY = p.y;
-            if (p.z < minZ) minZ = p.z;
-            if (p.x > maxX) maxX = p.x;
-            if (p.y > maxY) maxY = p.y;
-            if (p.z > maxZ) maxZ = p.z;
-        }
-
-        const cx = (minX + maxX) / 2;
-        const cy = (minY + maxY) / 2;
-        const cz = (minZ + maxZ) / 2;
-
-        let maxRadius = 0;
-        for (const p of list) {
-            const dx = p.x - cx;
-            const dy = p.y - cy;
-            const dz = p.z - cz;
-            const r = Math.sqrt(dx * dx + dy * dy + dz * dz);
-            if (r > maxRadius) maxRadius = r;
-        }
-
-        const positions = new Float32Array(numPoints * 3);
-        const colors = new Float32Array(numPoints * 3);
-
-        const LABEL_SIZE = 0.1;
-        const LABEL_OFFSET_Y = 0.18;
-
-        for (let i = 0; i < numPoints; i++) {
-            const p = list[i];
-
-            const idx = i * 3;
-            positions[idx] = p.x;
-            positions[idx + 1] = p.y;
-            positions[idx + 2] = p.z;
-
-            const r = p.r ?? 1;
-            const g = p.g ?? 1;
-            const b = p.b ?? 1;
-            colors[idx] = r;
-            colors[idx + 1] = g;
-            colors[idx + 2] = b;
-
-            const labelText = String(p.label ?? "").trim();
-            if (labelText) {
-                const labelGeo = new TextGeometry(labelText, {
-                    font,
-                    size: LABEL_SIZE,
-                    height: 0,
-                    curveSegments: 4
-                });
-                labelGeo.computeBoundingBox();
-                const bbox = labelGeo.boundingBox;
-                const textWidth = bbox.max.x - bbox.min.x;
-
-                const labelMat = new THREE.MeshBasicMaterial({
-                    color: 0xffffff
-                });
-
-                const labelMesh = new THREE.Mesh(labelGeo, labelMat);
-                labelMesh.position.set(
-                    p.x - textWidth / 2,
-                    p.y + LABEL_OFFSET_Y,
-                    p.z
-                );
-                group.add(labelMesh);
+        for (let i = 0; i < positions.length; i++) {
+            const dx = positions[i][0] - x;
+            const dy = positions[i][1] - y;
+            const d = dx*dx + dy*dy;
+            if (d < bd) {
+                bd = d;
+                best = i;
             }
         }
 
-        const geo = new THREE.BufferGeometry();
-        geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-        geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-
-        const mat = new THREE.PointsMaterial({
-            size: 0.15,
-            vertexColors: true,
-            sizeAttenuation: true,
-            map: circleTexture,
-            alphaTest: 0.1
-        });
-
-        pointsMesh = new THREE.Points(geo, mat);
-        group.add(pointsMesh);
-
-        const center = new THREE.Vector3(cx, cy, cz);
-        frameCameraToBounds(center, maxRadius);
-    }
-
-    // ------------------------------------------------------------
-    // animation
-    // ------------------------------------------------------------
-    function animate() {
-        requestAnimationFrame(animate);
-        controls.update();
-        renderer.render(scene, camera);
-    }
-    animate();
-
-    // ------------------------------------------------------------
-    // bootstrap
-    // ------------------------------------------------------------
-    (async function main() {
-        try {
-            const fontLoader = new FontLoader();
-            const [font, data] = await Promise.all([
-                fontLoader.loadAsync(
-                    "https://esm.sh/three@0.161.0/examples/fonts/helvetiker_regular.typeface.json"
-                ),
-                fetch("vectors.json").then(res => {
-                    if (!res.ok) {
-                        throw new Error(`http ${res.status}`);
-                    }
-                    return res.json();
-                })
-            ]);
-
-            initCloud(font, data);
-            loading.remove();
-            canvas.classList.add("ready");
-        } catch (err) {
-            console.error(err);
-            loading.textContent = "failed to load.";
+        if (best >= 0) {
+            info.textContent = labels[best];
         }
-    })();
+    });
+
+    const regl = createREGL({canvas: canvas});
+
+    const draw = regl({
+        frag: `
+            precision mediump float;
+            varying vec3 vcolor;
+            void main() {
+                float d = length(gl_PointCoord.xy - 0.5);
+                if (d > 0.5) discard;
+                gl_FragColor = vec4(vcolor, 1.0);
+            }
+        `,
+        vert: `
+            precision mediump float;
+            attribute vec2 position;
+            attribute vec3 color;
+            uniform float zoom;
+            uniform vec2 offset;
+            uniform vec2 viewport;
+
+            varying vec3 vcolor;
+
+            void main() {
+                vec2 p = (position + offset) * zoom;
+                vec2 clip = 2.0 * p / viewport;
+                gl_Position = vec4(clip, 0.0, 1.0);
+                gl_PointSize = 6.0;
+                vcolor = color;
+            }
+        `,
+        attributes: {
+            position: positions,
+            color: colors,
+        },
+        uniforms: {
+            zoom: () => zoom,
+            offset: () => offset,
+            viewport: () => [canvas.width/2, canvas.height/2],
+        },
+        count: positions.length,
+        primitive: 'points',
+    });
+
+    regl.frame(() => {
+        regl.clear({color: [0.04,0.04,0.08,1], depth: 1});
+        draw();
+    });
+}
 </script>
 
 </body>

@@ -4,19 +4,48 @@
 <meta charset="UTF-8">
 <title>semantic cloud viewer</title>
 <style>
+    :root {
+        color-scheme: dark;
+    }
+
     body {
         margin: 0;
         overflow: hidden;
-        background: #0a0a0f;
-        font-family: sans-serif;
+        background: radial-gradient(circle at top, #141420 0, #050509 55%, #000 100%);
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+            sans-serif;
+        color: #eee;
     }
+
     #loading {
         position: fixed;
         top: 50%;
         left: 50%;
         transform: translate(-50%, -50%);
         color: #aaa;
-        font-size: 20px;
+        font-size: 13px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        text-align: center;
+        padding: 10px 18px;
+        background: rgba(5, 5, 12, 0.92);
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        backdrop-filter: blur(12px);
+        pointer-events: none;
+        z-index: 10;
+    }
+
+    #scene {
+        width: 100%;
+        height: 100%;
+        display: block;
+        opacity: 0;
+        transition: opacity 0.4s ease-out;
+    }
+
+    #scene.ready {
+        opacity: 1;
     }
 </style>
 </head>
@@ -32,73 +61,237 @@
 
     const loading = document.getElementById("loading");
 
-    // scene setup
+    // ------------------------------------------------------------
+    // scene + renderer
+    // ------------------------------------------------------------
     const scene = new THREE.Scene();
+
     const camera = new THREE.PerspectiveCamera(
         60,
         window.innerWidth / window.innerHeight,
         0.1,
-        2000
+        5000
     );
     camera.position.set(0, 0, 8);
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    const renderer = new THREE.WebGLRenderer({
+        antialias: true,
+        alpha: false
+    });
+    renderer.setPixelRatio(window.devicePixelRatio || 1);
     renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(devicePixelRatio);
-    renderer.setClearColor(0x0a0a0f, 1);
-    document.body.appendChild(renderer.domElement);
+    renderer.setClearColor(0x050509, 1);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.1;
 
+    const canvas = renderer.domElement;
+    canvas.id = "scene";
+    document.body.appendChild(canvas);
+
+    // ------------------------------------------------------------
     // controls
-    const controls = new OrbitControls(camera, renderer.domElement);
+    // ------------------------------------------------------------
+    const controls = new OrbitControls(camera, canvas);
     controls.enableDamping = true;
-    controls.dampingFactor = 0.05;
+    controls.dampingFactor = 0.06;
+    controls.rotateSpeed = 0.7;
+    controls.zoomSpeed = 0.8;
+    controls.enablePan = true;
 
-    // load font
-    const fontLoader = new FontLoader();
-    const font = await fontLoader.loadAsync(
-        "https://esm.sh/three@0.161.0/examples/fonts/helvetiker_regular.typeface.json"
-    );
+    // ------------------------------------------------------------
+    // lights (for labels)
+    // ------------------------------------------------------------
+    scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+    const keyLight = new THREE.PointLight(0xffffff, 1.4, 0, 2);
+    keyLight.position.set(8, 10, 12);
+    scene.add(keyLight);
 
-    // load vector data
-    const data = await fetch("vectors.json").then(res => res.json());
-    loading.remove();
-
+    // ------------------------------------------------------------
+    // root group
+    // ------------------------------------------------------------
     const group = new THREE.Group();
     scene.add(group);
 
-    // build scatter + labels
-    const positions = [];
-    const colors = [];
+    let pointsMesh = null;
 
-    data.points.forEach(p => {
-        positions.push(p.x, p.y, p.z);
-        colors.push(p.r, p.g, p.b);
+    // ------------------------------------------------------------
+    // resize
+    // ------------------------------------------------------------
+    window.addEventListener("resize", () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
 
-        const geo = new TextGeometry(p.label, {
-            font: font,
-            size: 0.08,
-            height: 0.001,
+    // ------------------------------------------------------------
+    // small circular sprite texture for points
+    // ------------------------------------------------------------
+    function makeCircleTexture() {
+        const size = 64;
+        const cvs = document.createElement("canvas");
+        cvs.width = cvs.height = size;
+        const ctx = cvs.getContext("2d");
+
+        ctx.clearRect(0, 0, size, size);
+        const r = size / 2 - 1;
+
+        const grad = ctx.createRadialGradient(
+            size / 2,
+            size / 2,
+            r * 0.1,
+            size / 2,
+            size / 2,
+            r
+        );
+        grad.addColorStop(0, "rgba(255,255,255,1)");
+        grad.addColorStop(1, "rgba(255,255,255,0)");
+
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(size / 2, size / 2, r, 0, Math.PI * 2);
+        ctx.fill();
+
+        const tex = new THREE.CanvasTexture(cvs);
+        tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        tex.needsUpdate = true;
+        return tex;
+    }
+
+    const circleTexture = makeCircleTexture();
+
+    // ------------------------------------------------------------
+    // camera framing (no normalization, just view-fitting)
+    // ------------------------------------------------------------
+    function frameCameraToBounds(center, radius) {
+        if (!isFinite(radius) || radius <= 0) {
+            camera.position.set(center.x, center.y, center.z + 5);
+            camera.near = 0.1;
+            camera.far = 1000;
+            camera.updateProjectionMatrix();
+            controls.target.copy(center);
+            controls.update();
+            return;
+        }
+
+        const fov = THREE.MathUtils.degToRad(camera.fov);
+        const dist = radius / Math.sin(fov / 2) * 1.2;
+
+        camera.position.set(center.x, center.y, center.z + dist);
+        camera.near = Math.max(radius / 100, 0.01);
+        camera.far = radius * 10;
+        camera.updateProjectionMatrix();
+
+        controls.target.copy(center);
+        controls.update();
+    }
+
+    // ------------------------------------------------------------
+    // build cloud (raw coordinates, all labels visible)
+    // ------------------------------------------------------------
+    function initCloud(font, data) {
+        const list = Array.isArray(data.points) ? data.points : [];
+        if (!list.length) {
+            loading.textContent = "vectors.json has no points";
+            return;
+        }
+
+        const numPoints = list.length;
+
+        // bounds (for camera only, data stays raw)
+        let minX = Infinity, minY = Infinity, minZ = Infinity;
+        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+        for (const p of list) {
+            if (p.x < minX) minX = p.x;
+            if (p.y < minY) minY = p.y;
+            if (p.z < minZ) minZ = p.z;
+            if (p.x > maxX) maxX = p.x;
+            if (p.y > maxY) maxY = p.y;
+            if (p.z > maxZ) maxZ = p.z;
+        }
+
+        const cx = (minX + maxX) / 2;
+        const cy = (minY + maxY) / 2;
+        const cz = (minZ + maxZ) / 2;
+
+        let maxRadius = 0;
+        for (const p of list) {
+            const dx = p.x - cx;
+            const dy = p.y - cy;
+            const dz = p.z - cz;
+            const r = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            if (r > maxRadius) maxRadius = r;
+        }
+
+        const positions = new Float32Array(numPoints * 3);
+        const colors = new Float32Array(numPoints * 3);
+
+        const LABEL_SIZE = 0.1;
+        const LABEL_OFFSET_Y = 0.18;
+
+        for (let i = 0; i < numPoints; i++) {
+            const p = list[i];
+
+            const idx = i * 3;
+            positions[idx] = p.x;
+            positions[idx + 1] = p.y;
+            positions[idx + 2] = p.z;
+
+            const r = p.r ?? 1;
+            const g = p.g ?? 1;
+            const b = p.b ?? 1;
+            colors[idx] = r;
+            colors[idx + 1] = g;
+            colors[idx + 2] = b;
+
+            const labelText = String(p.label ?? "").trim();
+            if (labelText) {
+                const labelGeo = new TextGeometry(labelText, {
+                    font,
+                    size: LABEL_SIZE,
+                    height: 0,
+                    curveSegments: 4
+                });
+                labelGeo.computeBoundingBox();
+                const bbox = labelGeo.boundingBox;
+                const textWidth = bbox.max.x - bbox.min.x;
+
+                const labelMat = new THREE.MeshBasicMaterial({
+                    color: 0xffffff
+                });
+
+                const labelMesh = new THREE.Mesh(labelGeo, labelMat);
+                labelMesh.position.set(
+                    p.x - textWidth / 2,
+                    p.y + LABEL_OFFSET_Y,
+                    p.z
+                );
+                group.add(labelMesh);
+            }
+        }
+
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+
+        const mat = new THREE.PointsMaterial({
+            size: 0.15,
+            vertexColors: true,
+            sizeAttenuation: true,
+            map: circleTexture,
+            alphaTest: 0.1
         });
 
-        const mat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-        const mesh = new THREE.Mesh(geo, mat);
-        mesh.position.set(p.x, p.y, p.z);
-        group.add(mesh);
-    });
+        pointsMesh = new THREE.Points(geo, mat);
+        group.add(pointsMesh);
 
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-    geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+        const center = new THREE.Vector3(cx, cy, cz);
+        frameCameraToBounds(center, maxRadius);
+    }
 
-    const mat = new THREE.PointsMaterial({
-        size: 0.06,
-        vertexColors: true,
-    });
-
-    const pointsMesh = new THREE.Points(geo, mat);
-    group.add(pointsMesh);
-
-    // render loop
+    // ------------------------------------------------------------
+    // animation
+    // ------------------------------------------------------------
     function animate() {
         requestAnimationFrame(animate);
         controls.update();
@@ -106,12 +299,32 @@
     }
     animate();
 
-    // resize
-    window.addEventListener("resize", () => {
-        camera.aspect = window.innerWidth / window.innerHeight;
-        camera.updateProjectionMatrix();
-        renderer.setSize(window.innerWidth, window.innerHeight);
-    });
+    // ------------------------------------------------------------
+    // bootstrap
+    // ------------------------------------------------------------
+    (async function main() {
+        try {
+            const fontLoader = new FontLoader();
+            const [font, data] = await Promise.all([
+                fontLoader.loadAsync(
+                    "https://esm.sh/three@0.161.0/examples/fonts/helvetiker_regular.typeface.json"
+                ),
+                fetch("vectors.json").then(res => {
+                    if (!res.ok) {
+                        throw new Error(`http ${res.status}`);
+                    }
+                    return res.json();
+                })
+            ]);
+
+            initCloud(font, data);
+            loading.remove();
+            canvas.classList.add("ready");
+        } catch (err) {
+            console.error(err);
+            loading.textContent = "failed to load.";
+        }
+    })();
 </script>
 
 </body>

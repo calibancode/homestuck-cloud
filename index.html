@@ -1,265 +1,316 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="en">
 <head>
-<meta charset="utf-8">
-<title>Fast 2D Vector Explorer (LOD)</title>
+<meta charset="utf-8"/>
+<title>semantic cloud — webgl</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
 <style>
-    html, body {
-        margin: 0; padding: 0;
-        overflow: hidden;
-        background: #0a0a0f;
-        font-family: sans-serif;
-        color: white;
-    }
-    #overlay {
-        position: fixed;
-        top: 10px; left: 10px;
-        background: rgba(0,0,0,0.5);
-        padding: 6px 10px;
-        border-radius: 4px;
-        font-size: 14px;
-        pointer-events: none;
-        color: #ddd;
-    }
+  html, body { margin:0; padding:0; height:100%; background:#0a0a0f; color:#ddd; font:14px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;}
+  #wrap { position:fixed; inset:0; overflow:hidden; }
+  canvas { width:100%; height:100%; display:block; }
+  #hud { position:fixed; left:10px; bottom:10px; background:rgba(0,0,0,.45); padding:8px 10px; border:1px solid rgba(255,255,255,.15); border-radius:8px; backdrop-filter: blur(4px); }
+  #hint { opacity:.8 }
+  #tooltip {
+    position:fixed; pointer-events:none; transform:translate(-50%, calc(-100% - 10px));
+    background:rgba(0,0,0,.8); color:#fff; padding:6px 8px; border-radius:8px; border:1px solid rgba(255,255,255,.2);
+    font:12px ui-monospace, Menlo, Consolas, monospace; white-space:nowrap; display:none;
+  }
 </style>
 </head>
 <body>
-
-<canvas id="c"></canvas>
-<div id="overlay">loading…</div>
+<div id="wrap">
+  <canvas id="gl"></canvas>
+  <div id="tooltip"></div>
+  <div id="hud">
+    <div id="hint">drag = pan · wheel = zoom · r = reset · +/- = point size · f = fit</div>
+    <div id="stats"></div>
+  </div>
+</div>
 
 <script>
-////////////////////////////////////////////////////////////////
-// globals
-////////////////////////////////////////////////////////////////
-const canvas = document.getElementById("c");
-const ctx = canvas.getContext("2d");
-const overlay = document.getElementById("overlay");
-let DPR = window.devicePixelRatio || 1;
+(async function() {
+  // -------- config
+  const DATA_URL = 'vectors.json';   // put your file name here if different
+  let POINT_SIZE = 4.0;              // base pixel size (also adjustable with +/-)
+  const HOVER_RADIUS_PX = 16;        // hover pick radius in pixels
+  const HOVER_THROTTLE_MS = 30;      // limit picking work
 
-let W = 0, H = 0;
-let zoom = 300;
-let cx = 0;
-let cy = 0;
+  // -------- load data
+  const resp = await fetch(DATA_URL);
+  if (!resp.ok) {
+    console.error('failed to load', DATA_URL, resp.status);
+    document.getElementById('hint').textContent = `failed to load ${DATA_URL}`;
+    return;
+  }
+  const payload = await resp.json();
+  const pts = payload.points || [];
+  if (!pts.length) {
+    document.getElementById('hint').textContent = 'no points in vectors.json';
+    return;
+  }
 
-let pts = [];
-let hoverIdx = -1;
-let pinnedIdx = -1;
+  // pack to typed arrays
+  const N = pts.length;
+  const pos = new Float32Array(N * 2);
+  const col = new Float32Array(N * 3);
+  const labels = new Array(N);
+  let xmin=+Infinity, xmax=-Infinity, ymin=+Infinity, ymax=-Infinity;
 
-let isPanning = false;
-let panStart = [0, 0];
-let cx0, cy0;
+  for (let i=0; i<N; i++) {
+    const p = pts[i];
+    const x = p.x, y = p.y;
+    pos[2*i+0] = x;
+    pos[2*i+1] = y;
+    col[3*i+0] = p.r;
+    col[3*i+1] = p.g;
+    col[3*i+2] = p.b;
+    labels[i] = p.label ?? '';
+    if (x < xmin) xmin = x; if (x > xmax) xmax = x;
+    if (y < ymin) ymin = y; if (y > ymax) ymax = y;
+  }
 
-// spatial hash for fast picking
-let grid = {};
-let gridSize = 0.15; // world units per cell
+  // -------- webgl setup
+  const canvas = document.getElementById('gl');
+  const gl = canvas.getContext('webgl', {antialias:false, preserveDrawingBuffer:true});
+  if (!gl) {
+    document.getElementById('hint').textContent = 'webgl not available';
+    return;
+  }
+  const DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
 
-////////////////////////////////////////////////////////////////
-// resize
-////////////////////////////////////////////////////////////////
-function resize() {
-    W = window.innerWidth;
-    H = window.innerHeight;
-
-    canvas.width = W * DPR;
-    canvas.height = H * DPR;
-    canvas.style.width = W + "px";
-    canvas.style.height = H + "px";
-
-    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-    draw();
-}
-
-window.addEventListener("resize", resize);
-
-////////////////////////////////////////////////////////////////
-// coordinate transforms
-////////////////////////////////////////////////////////////////
-function clientToCanvas(x, y) {
-    const r = canvas.getBoundingClientRect();
-    return [
-        (x - r.left) * DPR,
-        (y - r.top) * DPR
-    ];
-}
-
-function screenToWorld(sx, sy) {
-    return [
-        cx + (sx / DPR - W/2) / zoom,
-        cy + (sy / DPR - H/2) / zoom
-    ];
-}
-
-function worldToScreen(x, y) {
-    return [
-        (x - cx) * zoom + W/2,
-        (y - cy) * zoom + H/2
-    ];
-}
-
-////////////////////////////////////////////////////////////////
-// LOD: decide how many points to skip
-////////////////////////////////////////////////////////////////
-function lodStep() {
-    if (zoom > 900) return 1;   // very zoomed in
-    if (zoom > 600) return 2;
-    if (zoom > 350) return 3;
-    if (zoom > 200) return 4;
-    if (zoom > 120) return 6;
-    if (zoom > 80)  return 10;
-    return 18; // zoomed out like hell — skip more
-}
-
-////////////////////////////////////////////////////////////////
-// spatial hash
-////////////////////////////////////////////////////////////////
-function buildSpatialIndex() {
-    grid = {};
-    for (let i = 0; i < pts.length; i++) {
-        const p = pts[i];
-        const gx = Math.floor(p.x / gridSize);
-        const gy = Math.floor(p.y / gridSize);
-        const key = gx + "," + gy;
-        if (!grid[key]) grid[key] = [];
-        grid[key].push(i);
+  const vsSrc = `
+    attribute vec2 a_pos;
+    attribute vec3 a_col;
+    uniform vec2 u_trans;
+    uniform float u_scale;
+    uniform vec2 u_res;
+    uniform float u_pt;
+    varying vec3 v_col;
+    void main() {
+      // world -> screen pixels
+      vec2 s = a_pos * u_scale + u_trans;
+      // screen -> clip
+      vec2 z01 = s / u_res;
+      vec2 clip = z01 * 2.0 - 1.0;
+      clip.y = -clip.y;
+      gl_Position = vec4(clip, 0.0, 1.0);
+      gl_PointSize = u_pt;
+      v_col = a_col;
     }
-}
-
-function pickNearest(worldX, worldY, rWorld) {
-    const gx = Math.floor(worldX / gridSize);
-    const gy = Math.floor(worldY / gridSize);
-
-    let best = -1;
-    let bestDist = rWorld * rWorld;
-
-    for (let dx=-1; dx<=1; dx++) {
-        for (let dy=-1; dy<=1; dy++) {
-            const bucket = grid[(gx+dx)+","+(gy+dy)];
-            if (!bucket) continue;
-
-            for (const idx of bucket) {
-                const p = pts[idx];
-                const dxw = p.x - worldX;
-                const dyw = p.y - worldY;
-                const d2 = dxw*dxw + dyw*dyw;
-                if (d2 < bestDist) {
-                    bestDist = d2;
-                    best = idx;
-                }
-            }
-        }
+  `;
+  const fsSrc = `
+    precision mediump float;
+    varying vec3 v_col;
+    void main() {
+      // round points
+      vec2 p = gl_PointCoord - vec2(0.5);
+      if (dot(p,p) > 0.25) discard;
+      gl_FragColor = vec4(v_col, 0.95);
     }
-    return best;
-}
+  `;
+  function compile(type, src){
+    const sh = gl.createShader(type); gl.shaderSource(sh, src); gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+    return sh;
+  }
+  function program(vs, fs){
+    const pr = gl.createProgram();
+    gl.attachShader(pr, vs); gl.attachShader(pr, fs); gl.linkProgram(pr);
+    if (!gl.getProgramParameter(pr, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(pr));
+    return pr;
+  }
+  const prog = program(compile(gl.VERTEX_SHADER, vsSrc), compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.useProgram(prog);
 
-////////////////////////////////////////////////////////////////
-// mouse events
-////////////////////////////////////////////////////////////////
-window.addEventListener("mousemove", (e) => {
-    const [sx, sy] = clientToCanvas(e.clientX, e.clientY);
+  // buffers
+  const posBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
 
-    if (isPanning) {
-        const dx = (e.clientX - panStart[0]) / zoom;
-        const dy = (e.clientY - panStart[1]) / zoom;
-        cx = cx0 - dx;
-        cy = cy0 - dy;
-        draw();
-    } else {
-        const [wx, wy] = screenToWorld(sx, sy);
-        hoverIdx = pickNearest(wx, wy, 0.04);
-        draw();
+  const colBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, colBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, col, gl.STATIC_DRAW);
+
+  const a_pos = gl.getAttribLocation(prog, 'a_pos');
+  const a_col = gl.getAttribLocation(prog, 'a_col');
+  const u_trans = gl.getUniformLocation(prog, 'u_trans');
+  const u_scale = gl.getUniformLocation(prog, 'u_scale');
+  const u_res = gl.getUniformLocation(prog, 'u_res');
+  const u_pt   = gl.getUniformLocation(prog, 'u_pt');
+
+  // attribute setup
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+  gl.enableVertexAttribArray(a_pos);
+  gl.vertexAttribPointer(a_pos, 2, gl.FLOAT, false, 0, 0);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, colBuf);
+  gl.enableVertexAttribArray(a_col);
+  gl.vertexAttribPointer(a_col, 3, gl.FLOAT, false, 0, 0);
+
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.clearColor(0.039, 0.039, 0.059, 1.0);
+
+  // -------- view transform (scale, translate in pixels)
+  let W=0, H=0;
+  let scale = 1;
+  let trans = [0,0];
+
+  function fitView(pad=0.08){
+    const xrange = xmax - xmin || 1;
+    const yrange = ymax - ymin || 1;
+    const sx = (W * (1 - pad*2)) / xrange;
+    const sy = (H * (1 - pad*2)) / yrange;
+    scale = Math.min(sx, sy);
+    const cx = (xmin + xmax) * 0.5;
+    const cy = (ymin + ymax) * 0.5;
+    trans = [ W*0.5 - cx*scale, H*0.5 - cy*scale ];
+  }
+
+  function resize(){
+    const rect = canvas.getBoundingClientRect();
+    W = Math.max(1, Math.floor(rect.width * DPR));
+    H = Math.max(1, Math.floor(rect.height * DPR));
+    if (canvas.width !== W || canvas.height !== H){
+      canvas.width = W; canvas.height = H;
     }
-});
+    gl.viewport(0,0,W,H);
+    gl.uniform2f(u_res, W, H);
+    fitView();  // keep it simple; refit on resize
+  }
+  window.addEventListener('resize', resize, {passive:true});
+  resize();
 
-canvas.addEventListener("mousedown", (e) => {
-    isPanning = true;
-    panStart = [e.clientX, e.clientY];
-    cx0 = cx;
-    cy0 = cy;
-});
+  // -------- interaction: pan / zoom (zoom at cursor)
+  let isPanning=false, lastX=0, lastY=0;
+  canvas.addEventListener('mousedown', (e)=>{
+    isPanning=true; lastX=e.clientX*DPR; lastY=e.clientY*DPR;
+  });
+  window.addEventListener('mouseup', ()=> isPanning=false);
+  window.addEventListener('mousemove', (e)=>{
+    if (!isPanning) return;
+    const x=e.clientX*DPR, y=e.clientY*DPR;
+    trans[0] += (x - lastX);
+    trans[1] += (y - lastY);
+    lastX=x; lastY=y;
+    requestRender();
+  }, {passive:true});
 
-window.addEventListener("mouseup", () => {
-    isPanning = false;
-});
+  function screenToWorld(sx, sy){
+    // invert world->screen: (p*s + t) = sxy
+    return [ (sx - trans[0]) / scale, (sy - trans[1]) / scale ];
+  }
+  function worldToScreen(wx, wy){
+    return [ wx*scale + trans[0], wy*scale + trans[1] ];
+  }
 
-canvas.addEventListener("click", (e) => {
-    const [sx, sy] = clientToCanvas(e.clientX, e.clientY);
-    const [wx, wy] = screenToWorld(sx, sy);
-    const idx = pickNearest(wx, wy, 0.04);
-    if (idx !== -1) pinnedIdx = idx;
-    draw();
-});
-
-canvas.addEventListener("wheel", (e) => {
+  canvas.addEventListener('wheel', (e)=>{
     e.preventDefault();
-    const [sx, sy] = clientToCanvas(e.clientX, e.clientY);
-    const [wx, wy] = screenToWorld(sx, sy);
+    const mouseX = e.clientX * DPR;
+    const mouseY = e.clientY * DPR;
 
-    const factor = Math.pow(1.15, -Math.sign(e.deltaY));
-    zoom = Math.max(50, Math.min(6000, zoom * factor));
+    // world point under cursor before zoom
+    const [wx, wy] = screenToWorld(mouseX, mouseY);
 
-    cx = wx - (sx / DPR - W/2) / zoom;
-    cy = wy - (sy / DPR - H/2) / zoom;
+    // zoom factor
+    const k = Math.pow(1.0015, -e.deltaY); // smooth
+    const newScale = Math.min(1e6, Math.max(1e-6, scale * k));
 
-    draw();
-}, { passive:false });
+    // adjust translation so (wx,wy) stays anchored to cursor
+    trans[0] = mouseX - wx * newScale;
+    trans[1] = mouseY - wy * newScale;
+    scale = newScale;
 
-////////////////////////////////////////////////////////////////
-// drawing
-////////////////////////////////////////////////////////////////
-function draw() {
-    ctx.fillStyle = "#0a0a0f";
-    ctx.fillRect(0, 0, W, H);
+    requestRender();
+    schedulePick(mouseX, mouseY);
+  }, {passive:false});
 
-    const step = lodStep();
+  window.addEventListener('keydown', (e)=>{
+    if (e.key === 'r') { fitView(); requestRender(); }
+    if (e.key === 'f') { fitView(); requestRender(); }
+    if (e.key === '+') { POINT_SIZE = Math.min(24, POINT_SIZE + 1); requestRender(); }
+    if (e.key === '=') { POINT_SIZE = Math.min(24, POINT_SIZE + 1); requestRender(); }
+    if (e.key === '-') { POINT_SIZE = Math.max(1, POINT_SIZE - 1); requestRender(); }
+  });
 
-    // batch rendering by skipping points
-    ctx.lineWidth = 1;
+  // -------- render
+  function render(){
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(prog);
+    gl.uniform2f(u_trans, trans[0], trans[1]);
+    gl.uniform1f(u_scale, scale);
+    gl.uniform1f(u_pt, POINT_SIZE * DPR);
+    gl.drawArrays(gl.POINTS, 0, N);
 
-    for (let i=0; i<pts.length; i+=step) {
-        const p = pts[i];
-        const [sx, sy] = worldToScreen(p.x, p.y);
+    stats.textContent = `${N.toLocaleString()} points · scale ${scale.toFixed(2)} · size ${POINT_SIZE}px`;
+  }
+  let raf=0;
+  function requestRender(){
+    if (raf) return;
+    raf = requestAnimationFrame(()=>{ raf=0; render(); });
+  }
+  const stats = document.getElementById('stats');
 
-        ctx.fillStyle = `rgb(${p.r*255}, ${p.g*255}, ${p.b*255})`;
-        const size = (i===hoverIdx || i===pinnedIdx) ? 6 : 3;
+  // initial draw
+  requestRender();
 
-        ctx.beginPath();
-        ctx.arc(sx, sy, size, 0, Math.PI*2);
-        ctx.fill();
+  // -------- hover picking (CPU, viewport-limited, throttled)
+  const tooltip = document.getElementById('tooltip');
+  let pickTimer = 0;
+  let lastMouseX=0, lastMouseY=0;
+
+  function schedulePick(x, y){
+    lastMouseX=x; lastMouseY=y;
+    if (pickTimer) return;
+    pickTimer = setTimeout(()=>{ pickTimer=0; doPick(x, y); }, HOVER_THROTTLE_MS);
+  }
+
+  canvas.addEventListener('mousemove', (e)=>{
+    const x=e.clientX*DPR, y=e.clientY*DPR;
+    schedulePick(x, y);
+  }, {passive:true});
+
+  function doPick(mouseX, mouseY){
+    // compute world rect for viewport + small pad
+    const pad = HOVER_RADIUS_PX;
+    const [w0x, w0y] = screenToWorld(mouseX - pad, mouseY - pad);
+    const [w1x, w1y] = screenToWorld(mouseX + pad, mouseY + pad);
+    const minx = Math.min(w0x, w1x), maxx = Math.max(w0x, w1x);
+    const miny = Math.min(w0y, w1y), maxy = Math.max(w0y, w1y);
+
+    let best = -1, bestD2 = (HOVER_RADIUS_PX * HOVER_RADIUS_PX);
+    // linear scan (fast enough with viewport cut + throttle). if you ever push 1M+ points, we can grid-index.
+    for (let i=0; i<N; i++){
+      const wx = pos[2*i+0];
+      const wy = pos[2*i+1];
+      if (wx < minx || wx > maxx || wy < miny || wy > maxy) continue;
+
+      const scrx = wx*scale + trans[0];
+      const scry = wy*scale + trans[1];
+      const dx = scrx - mouseX;
+      const dy = scry - mouseY;
+      const d2 = dx*dx + dy*dy;
+      if (d2 < bestD2) { bestD2 = d2; best = i; }
     }
 
-    // hover label
-    if (hoverIdx !== -1) {
-        const p = pts[hoverIdx];
-        const [sx, sy] = worldToScreen(p.x, p.y);
-        ctx.fillStyle = "white";
-        ctx.fillText(p.label, sx + 10, sy - 10);
+    if (best >= 0){
+      // place tooltip
+      tooltip.style.display = 'block';
+      tooltip.textContent = labels[best];
+      // place above cursor
+      const cssX = mouseX / DPR;
+      const cssY = mouseY / DPR;
+      tooltip.style.left = cssX + 'px';
+      tooltip.style.top = cssY + 'px';
+    } else {
+      tooltip.style.display = 'none';
     }
+  }
 
-    // pinned label
-    if (pinnedIdx !== -1) {
-        const p = pts[pinnedIdx];
-        const [sx, sy] = worldToScreen(p.x, p.y);
-        ctx.fillStyle = "rgb(255,200,100)";
-        ctx.fillText(p.label, sx + 10, sy + 4);
-    }
-}
+  // pick also on pan end (mouse up) so the label relocates
+  window.addEventListener('mouseup', ()=>{ if (lastMouseX) schedulePick(lastMouseX, lastMouseY); });
 
-////////////////////////////////////////////////////////////////
-// load vector data
-////////////////////////////////////////////////////////////////
-async function loadData() {
-    let res = await fetch("vectors.json");
-    let data = await res.json();
-    pts = data.points;
-
-    overlay.textContent = `loaded ${pts.length} points`;
-    buildSpatialIndex();
-    draw();
-}
-
-resize();
-loadData();
+})();
 </script>
 </body>
 </html>

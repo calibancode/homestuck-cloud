@@ -1,165 +1,265 @@
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
-<title>2D Semantic Explorer</title>
+<meta charset="utf-8">
+<title>Fast 2D Vector Explorer (LOD)</title>
 <style>
-    body {
-        margin: 0;
+    html, body {
+        margin: 0; padding: 0;
         overflow: hidden;
         background: #0a0a0f;
         font-family: sans-serif;
         color: white;
     }
-    #info {
+    #overlay {
         position: fixed;
-        top: 10px;
-        left: 10px;
+        top: 10px; left: 10px;
         background: rgba(0,0,0,0.5);
         padding: 6px 10px;
-        border-radius: 6px;
+        border-radius: 4px;
         font-size: 14px;
         pointer-events: none;
-        max-width: 380px;
-        white-space: pre-wrap;
+        color: #ddd;
     }
 </style>
 </head>
 <body>
 
 <canvas id="c"></canvas>
-<div id="info">loading…</div>
-
-<script src="https://cdn.jsdelivr.net/npm/regl/dist/regl.min.js"></script>
+<div id="overlay">loading…</div>
 
 <script>
+////////////////////////////////////////////////////////////////
+// globals
+////////////////////////////////////////////////////////////////
 const canvas = document.getElementById("c");
-const info = document.getElementById("info");
+const ctx = canvas.getContext("2d");
+const overlay = document.getElementById("overlay");
+let DPR = window.devicePixelRatio || 1;
 
+let W = 0, H = 0;
+let zoom = 300;
+let cx = 0;
+let cy = 0;
+
+let pts = [];
+let hoverIdx = -1;
+let pinnedIdx = -1;
+
+let isPanning = false;
+let panStart = [0, 0];
+let cx0, cy0;
+
+// spatial hash for fast picking
+let grid = {};
+let gridSize = 0.15; // world units per cell
+
+////////////////////////////////////////////////////////////////
+// resize
+////////////////////////////////////////////////////////////////
 function resize() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+    W = window.innerWidth;
+    H = window.innerHeight;
+
+    canvas.width = W * DPR;
+    canvas.height = H * DPR;
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    draw();
 }
-window.addEventListener('resize', resize);
-resize();
 
-// --------------------------------------
-// load vectors.json
-// --------------------------------------
-fetch("vectors.json")
-    .then(r => r.json())
-    .then(run);
+window.addEventListener("resize", resize);
 
-function run(data) {
-    info.textContent = "loaded " + data.points.length + " points";
+////////////////////////////////////////////////////////////////
+// coordinate transforms
+////////////////////////////////////////////////////////////////
+function clientToCanvas(x, y) {
+    const r = canvas.getBoundingClientRect();
+    return [
+        (x - r.left) * DPR,
+        (y - r.top) * DPR
+    ];
+}
 
-    const pts = data.points;
+function screenToWorld(sx, sy) {
+    return [
+        cx + (sx / DPR - W/2) / zoom,
+        cy + (sy / DPR - H/2) / zoom
+    ];
+}
 
-    const positions = pts.map(p => [p.x, p.y]);
-    const colors = pts.map(p => [p.r, p.g, p.b]);
-    const labels = pts.map(p => p.label);
+function worldToScreen(x, y) {
+    return [
+        (x - cx) * zoom + W/2,
+        (y - cy) * zoom + H/2
+    ];
+}
 
-    // pan & zoom
-    let zoom = 1.0;
-    let offset = [0, 0];
+////////////////////////////////////////////////////////////////
+// LOD: decide how many points to skip
+////////////////////////////////////////////////////////////////
+function lodStep() {
+    if (zoom > 900) return 1;   // very zoomed in
+    if (zoom > 600) return 2;
+    if (zoom > 350) return 3;
+    if (zoom > 200) return 4;
+    if (zoom > 120) return 6;
+    if (zoom > 80)  return 10;
+    return 18; // zoomed out like hell — skip more
+}
 
-    canvas.onwheel = e => {
-        const z = Math.exp(-e.deltaY * 0.001);
-        zoom *= z;
-    };
+////////////////////////////////////////////////////////////////
+// spatial hash
+////////////////////////////////////////////////////////////////
+function buildSpatialIndex() {
+    grid = {};
+    for (let i = 0; i < pts.length; i++) {
+        const p = pts[i];
+        const gx = Math.floor(p.x / gridSize);
+        const gy = Math.floor(p.y / gridSize);
+        const key = gx + "," + gy;
+        if (!grid[key]) grid[key] = [];
+        grid[key].push(i);
+    }
+}
 
-    let dragging = false;
-    let lx = 0, ly = 0;
+function pickNearest(worldX, worldY, rWorld) {
+    const gx = Math.floor(worldX / gridSize);
+    const gy = Math.floor(worldY / gridSize);
 
-    canvas.onmousedown = e => {
-        dragging = true;
-        lx = e.clientX;
-        ly = e.clientY;
-    };
-    canvas.onmouseup = () => dragging = false;
-    canvas.onmouseleave = () => dragging = false;
-    canvas.onmousemove = e => {
-        if (dragging) {
-            offset[0] += (e.clientX - lx) / zoom;
-            offset[1] -= (e.clientY - ly) / zoom;
-            lx = e.clientX;
-            ly = e.clientY;
-        }
-    };
+    let best = -1;
+    let bestDist = rWorld * rWorld;
 
-    // nearest-point hover
-    canvas.addEventListener("mousemove", e => {
-        const rect = canvas.getBoundingClientRect();
-        const x = (e.clientX - rect.left - canvas.width/2) / zoom - offset[0];
-        const y = -(e.clientY - rect.top - canvas.height/2) / zoom - offset[1];
+    for (let dx=-1; dx<=1; dx++) {
+        for (let dy=-1; dy<=1; dy++) {
+            const bucket = grid[(gx+dx)+","+(gy+dy)];
+            if (!bucket) continue;
 
-        let best = -1;
-        let bd = 0.03;
-
-        for (let i = 0; i < positions.length; i++) {
-            const dx = positions[i][0] - x;
-            const dy = positions[i][1] - y;
-            const d = dx*dx + dy*dy;
-            if (d < bd) {
-                bd = d;
-                best = i;
+            for (const idx of bucket) {
+                const p = pts[idx];
+                const dxw = p.x - worldX;
+                const dyw = p.y - worldY;
+                const d2 = dxw*dxw + dyw*dyw;
+                if (d2 < bestDist) {
+                    bestDist = d2;
+                    best = idx;
+                }
             }
         }
+    }
+    return best;
+}
 
-        if (best >= 0) {
-            info.textContent = labels[best];
-        }
-    });
+////////////////////////////////////////////////////////////////
+// mouse events
+////////////////////////////////////////////////////////////////
+window.addEventListener("mousemove", (e) => {
+    const [sx, sy] = clientToCanvas(e.clientX, e.clientY);
 
-    const regl = createREGL({canvas: canvas});
-
-    const draw = regl({
-        frag: `
-            precision mediump float;
-            varying vec3 vcolor;
-            void main() {
-                float d = length(gl_PointCoord.xy - 0.5);
-                if (d > 0.5) discard;
-                gl_FragColor = vec4(vcolor, 1.0);
-            }
-        `,
-        vert: `
-            precision mediump float;
-            attribute vec2 position;
-            attribute vec3 color;
-            uniform float zoom;
-            uniform vec2 offset;
-            uniform vec2 viewport;
-
-            varying vec3 vcolor;
-
-            void main() {
-                vec2 p = (position + offset) * zoom;
-                vec2 clip = 2.0 * p / viewport;
-                gl_Position = vec4(clip, 0.0, 1.0);
-                gl_PointSize = 6.0;
-                vcolor = color;
-            }
-        `,
-        attributes: {
-            position: positions,
-            color: colors,
-        },
-        uniforms: {
-            zoom: () => zoom,
-            offset: () => offset,
-            viewport: () => [canvas.width/2, canvas.height/2],
-        },
-        count: positions.length,
-        primitive: 'points',
-    });
-
-    regl.frame(() => {
-        regl.clear({color: [0.04,0.04,0.08,1], depth: 1});
+    if (isPanning) {
+        const dx = (e.clientX - panStart[0]) / zoom;
+        const dy = (e.clientY - panStart[1]) / zoom;
+        cx = cx0 - dx;
+        cy = cy0 - dy;
         draw();
-    });
-}
-</script>
+    } else {
+        const [wx, wy] = screenToWorld(sx, sy);
+        hoverIdx = pickNearest(wx, wy, 0.04);
+        draw();
+    }
+});
 
+canvas.addEventListener("mousedown", (e) => {
+    isPanning = true;
+    panStart = [e.clientX, e.clientY];
+    cx0 = cx;
+    cy0 = cy;
+});
+
+window.addEventListener("mouseup", () => {
+    isPanning = false;
+});
+
+canvas.addEventListener("click", (e) => {
+    const [sx, sy] = clientToCanvas(e.clientX, e.clientY);
+    const [wx, wy] = screenToWorld(sx, sy);
+    const idx = pickNearest(wx, wy, 0.04);
+    if (idx !== -1) pinnedIdx = idx;
+    draw();
+});
+
+canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const [sx, sy] = clientToCanvas(e.clientX, e.clientY);
+    const [wx, wy] = screenToWorld(sx, sy);
+
+    const factor = Math.pow(1.15, -Math.sign(e.deltaY));
+    zoom = Math.max(50, Math.min(6000, zoom * factor));
+
+    cx = wx - (sx / DPR - W/2) / zoom;
+    cy = wy - (sy / DPR - H/2) / zoom;
+
+    draw();
+}, { passive:false });
+
+////////////////////////////////////////////////////////////////
+// drawing
+////////////////////////////////////////////////////////////////
+function draw() {
+    ctx.fillStyle = "#0a0a0f";
+    ctx.fillRect(0, 0, W, H);
+
+    const step = lodStep();
+
+    // batch rendering by skipping points
+    ctx.lineWidth = 1;
+
+    for (let i=0; i<pts.length; i+=step) {
+        const p = pts[i];
+        const [sx, sy] = worldToScreen(p.x, p.y);
+
+        ctx.fillStyle = `rgb(${p.r*255}, ${p.g*255}, ${p.b*255})`;
+        const size = (i===hoverIdx || i===pinnedIdx) ? 6 : 3;
+
+        ctx.beginPath();
+        ctx.arc(sx, sy, size, 0, Math.PI*2);
+        ctx.fill();
+    }
+
+    // hover label
+    if (hoverIdx !== -1) {
+        const p = pts[hoverIdx];
+        const [sx, sy] = worldToScreen(p.x, p.y);
+        ctx.fillStyle = "white";
+        ctx.fillText(p.label, sx + 10, sy - 10);
+    }
+
+    // pinned label
+    if (pinnedIdx !== -1) {
+        const p = pts[pinnedIdx];
+        const [sx, sy] = worldToScreen(p.x, p.y);
+        ctx.fillStyle = "rgb(255,200,100)";
+        ctx.fillText(p.label, sx + 10, sy + 4);
+    }
+}
+
+////////////////////////////////////////////////////////////////
+// load vector data
+////////////////////////////////////////////////////////////////
+async function loadData() {
+    let res = await fetch("vectors.json");
+    let data = await res.json();
+    pts = data.points;
+
+    overlay.textContent = `loaded ${pts.length} points`;
+    buildSpatialIndex();
+    draw();
+}
+
+resize();
+loadData();
+</script>
 </body>
 </html>

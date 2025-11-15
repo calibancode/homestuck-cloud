@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>semantic cloud viewer</title>
+<style>
+    body {
+        margin: 0;
+        overflow: hidden;
+        background: #0a0a0f;
+        font-family: sans-serif;
+    }
+    #loading {
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        color: #aaa;
+        font-size: 20px;
+    }
+</style>
+</head>
+
+<body>
+<div id="loading">loading…</div>
+
+<script type="module">
+    import * as THREE from "https://esm.sh/three@0.161.0";
+    import { OrbitControls } from "https://esm.sh/three@0.161.0/examples/jsm/controls/OrbitControls.js";
+    import { FontLoader } from "https://esm.sh/three@0.161.0/examples/jsm/loaders/FontLoader.js";
+    import { TextGeometry } from "https://esm.sh/three@0.161.0/examples/jsm/geometries/TextGeometry.js";
+
+    const loading = document.getElementById("loading");
+
+    // scene setup
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(
+        60,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        2000
+    );
+    camera.position.set(0, 0, 8);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(devicePixelRatio);
+    renderer.setClearColor(0x0a0a0f, 1);
+    document.body.appendChild(renderer.domElement);
+
+    // controls
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+
+    // load font
+    const fontLoader = new FontLoader();
+    const font = await fontLoader.loadAsync(
+        "https://esm.sh/three@0.161.0/examples/fonts/helvetiker_regular.typeface.json"
+    );
+
+    // load vector data
+    const data = await fetch("output.json").then(res => res.json());
+    loading.remove();
+
+    const group = new THREE.Group();
+    scene.add(group);
+
+    // build scatter + labels
+    const positions = [];
+    const colors = [];
+
+    data.points.forEach(p => {
+        positions.push(p.x, p.y, p.z);
+        colors.push(p.r, p.g, p.b);
+
+        const geo = new TextGeometry(p.label, {
+            font: font,
+            size: 0.08,
+            height: 0.001,
+        });
+
+        const mat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.set(p.x, p.y, p.z);
+        group.add(mesh);
+    });
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+
+    const mat = new THREE.PointsMaterial({
+        size: 0.06,
+        vertexColors: true,
+    });
+
+    const pointsMesh = new THREE.Points(geo, mat);
+    group.add(pointsMesh);
+
+    // render loop
+    function animate() {
+        requestAnimationFrame(animate);
+        controls.update();
+        renderer.render(scene, camera);
+    }
+    animate();
+
+    // resize
+    window.addEventListener("resize", () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+</script>
+
+</body>
+</html>
